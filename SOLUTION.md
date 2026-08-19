@@ -85,3 +85,29 @@ immediately after. On the old code the process exited almost instantly and
 goroutine and `recording_processed` was `true` by the time it exited. Also added unit tests
 for `Shutdown` directly — it waits for real in-flight work to finish, and it returns the
 context's error instead of hanging when the deadline is already gone.
+
+## Why Postgres, not Redis, for dedup
+
+Went with the `events.event_id` unique constraint + `INSERT ... ON CONFLICT DO NOTHING` from
+bug 1, rather than a Redis `SETNX` lock or an app-level in-memory dedup set.
+
+Redis `SETNX event_id` would work and would be faster, but it's a second source of truth that
+can drift from Postgres — if the process dies after the `SETNX` succeeds but before the
+Postgres insert commits, the event is marked "seen" in Redis forever but never actually
+landed in the DB, and a real redelivery would be dropped silently. Postgres already has to be
+the durable write for `events`/`calls`/`account_stats` either way, and it already gives me
+atomicity for free with a transaction — adding Redis into the dedup path buys speed at the
+cost of a second failure mode to reason about, for an endpoint that isn't latency-critical.
+An in-memory set is worse: it doesn't survive a restart or work across more than one instance.
+
+## At 10,000 webhooks/second
+
+The single-row `UPDATE account_stats ... call_count + 1` becomes the bottleneck first — every
+event for the same account serializes on that row. I'd move to sharded counters (or just let
+Postgres batch commits and lean on `synchronous_commit = off` for that table) and reconcile
+periodically, rather than updating the aggregate synchronously inside the request path.
+Beyond that: the in-memory `stats.Cache` mutex is a single global lock per process, so I'd
+shard it by account_id hash; and I'd add a connection pool ceiling / backpressure so a burst
+doesn't exhaust Postgres connections — right now there's no limit on concurrent in-flight
+`Ingest` calls beyond `DBMaxConns`. Redis would earn its place here as a write-behind buffer
+in front of Postgres rather than as the dedup mechanism.
