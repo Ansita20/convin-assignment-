@@ -16,6 +16,8 @@ import (
 // recordingWork stands in for downloading and transcoding a recording.
 const recordingWork = 50 * time.Millisecond
 
+const recordingProcessTimeout = 5 * time.Second
+
 // Service ingests webhook deliveries.
 type Service struct {
 	store *store.Store
@@ -65,8 +67,11 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
 		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
+			procCtx, cancel := context.WithTimeout(context.Background(), recordingProcessTimeout)
+			defer cancel()
+			if err := s.processRecording(procCtx, rec); err != nil {
+				s.log.Error("process recording failed",
+					"event_id", rec.EventID, "call_id", rec.CallID, "err", err)
 			}
 		}()
 	}
