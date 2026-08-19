@@ -62,3 +62,26 @@ error with the event/call IDs instead of the empty TODO branch.
 Proof: sent a webhook with a `recording_url` against the old code — `recording_processed`
 stayed `false` and nothing showed up in the logs, exactly as reported. Same request against
 the fix, run 5 times: `recording_processed` flipped to `true` every single time.
+
+## Bug 4: in-flight work lost on deploy
+
+`srv.Shutdown()` only waits for HTTP handlers that are still executing — it has no idea the
+handler spawned a goroutine and already returned. So on SIGTERM, the server stops accepting
+connections, waits for the (already-finished) handlers, and exits, while a recording goroutine
+from a request that just got acked 200 could still be mid-flight. Then `main()` returns, the
+Postgres pool closes, and the goroutine just dies wherever it was. Work the provider was told
+succeeded silently vanishes on every deploy.
+
+Fix: added a `sync.WaitGroup` to `Service`, `wg.Add(1)`/`defer wg.Done()` around the recording
+goroutine, and a `Shutdown(ctx)` method that waits on the group but bails out if `ctx` expires
+first (`wg.Wait()` has no built-in timeout, so it runs in its own goroutine and races against
+`ctx.Done()` in a select). Called from `main.go` right after `srv.Shutdown`, using the same
+10s shutdown context — after `srv.Shutdown`, not before, since that's what stops new requests
+from spawning more goroutines in the first place.
+
+Proof: built the actual binary, fired a webhook with a `recording_url`, then sent SIGTERM
+immediately after. On the old code the process exited almost instantly and
+`recording_processed` stayed `false`. On the fix, same sequence: the process waited for the
+goroutine and `recording_processed` was `true` by the time it exited. Also added unit tests
+for `Shutdown` directly — it waits for real in-flight work to finish, and it returns the
+context's error instead of hanging when the deadline is already gone.
